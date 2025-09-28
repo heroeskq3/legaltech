@@ -1,8 +1,6 @@
 <?php
 // =====================================
-// API REST Jurisprudencia CR
-// =====================================
-// Dependencias: NINGUNA (solo PHP nativo)
+// API REST Jurisprudencia CR (con coincidencias y salida estructurada)
 // =====================================
 
 // Cabeceras
@@ -15,32 +13,9 @@ header("Access-Control-Allow-Headers: Content-Type");
 // FUNCIONES
 // -----------------------------------------------------------------------------
 
-function obtenerIPconProxy($proxy, $proxyAuth) {
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL => 'https://api.ipify.org?format=json',
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_PROXY => $proxy,
-        CURLOPT_PROXYUSERPWD => $proxyAuth,
-        CURLOPT_HTTPPROXYTUNNEL => true,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_TIMEOUT => 30,
-    ]);
-    $response = curl_exec($ch);
-    curl_close($ch);
-    $data = json_decode($response, true);
-    return $data['ip'] ?? null;
-}
-
 function ask_nexusPJv2(string $pregunta, int $page = 1, int $size = 10, array $options = []): ?array {
     $endpoint   = 'https://nexuspj.poder-judicial.go.cr/api/search';
     $timeout    = (int)($options['timeout'] ?? 30);
-    $cookies    = (string)($options['cookies'] ?? '');
-    $origin     = (string)($options['origin'] ?? 'https://nexuspj.poder-judicial.go.cr');
-    $referer    = (string)($options['referer'] ?? 'https://nexuspj.poder-judicial.go.cr/search');
-    $userAgent  = (string)($options['user_agent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139 Safari/537.36');
 
     $payload = [
         'q'        => $pregunta,
@@ -56,10 +31,8 @@ function ask_nexusPJv2(string $pregunta, int $page = 1, int $size = 10, array $o
     $headers = [
         'Accept: application/json, text/plain, */*',
         'Content-Type: application/json;charset=UTF-8',
-        "Origin: {$origin}",
-        "Referer: {$referer}",
-        'Cache-Control: no-cache',
-        'Pragma: no-cache',
+        'Origin: https://nexuspj.poder-judicial.go.cr',
+        'Referer: https://nexuspj.poder-judicial.go.cr/search',
     ];
 
     $ch = curl_init($endpoint);
@@ -69,26 +42,12 @@ function ask_nexusPJv2(string $pregunta, int $page = 1, int $size = 10, array $o
         CURLOPT_POST           => true,
         CURLOPT_POSTFIELDS     => $json,
         CURLOPT_HTTPHEADER     => $headers,
-        CURLOPT_USERAGENT      => $userAgent,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0',
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_ENCODING       => '',  // gzip/deflate
         CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_2TLS,
     ]);
-
-    // Proxy opcional
-    if (!empty($options['proxy']) && !empty($options['proxy_auth'])) {
-        curl_setopt($ch, CURLOPT_PROXY, $options['proxy']);
-        curl_setopt($ch, CURLOPT_PROXYUSERPWD, $options['proxy_auth']);
-        curl_setopt($ch, CURLOPT_HTTPPROXYTUNNEL, true);
-    }
-
-    // Cookies opcionales
-    if ($cookies !== '') {
-        curl_setopt($ch, CURLOPT_COOKIE, $cookies);
-    }
 
     $response  = curl_exec($ch);
     $curlError = curl_error($ch);
@@ -100,18 +59,56 @@ function ask_nexusPJv2(string $pregunta, int $page = 1, int $size = 10, array $o
     }
 
     $data = json_decode($response, true);
-    if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
+    if (json_last_error() !== JSON_ERROR_NONE) {
         return ['error' => "JSON inválido: " . json_last_error_msg(), 'raw' => $response];
     }
 
     return $data;
 }
 
+function contarCoincidencias($texto, $palabras) {
+    $count = 0;
+    $texto = strtolower($texto);
+    foreach ($palabras as $p) {
+        if (empty($p)) continue;
+        $count += substr_count($texto, strtolower($p));
+    }
+    return $count;
+}
+
+function normalizarHit($hit, $keywords) {
+    $contenido = strip_tags($hit['content'] ?? '');
+    $coincidencias = contarCoincidencias($contenido, $keywords);
+
+    $resumen = '';
+    if (!empty($hit['highlight']['contenido'][0])) {
+        $resumen = strip_tags($hit['highlight']['contenido'][0]);
+    } else {
+        $resumen = mb_substr($contenido, 0, 400) . "...";
+    }
+
+    return [
+        "coincidencia" => $coincidencias,
+        "url"          => isset($hit['idDocument']) ? "https://nexuspj.poder-judicial.go.cr/document/" . $hit['idDocument'] : null,
+        "expediente"   => $hit['expediente'] ?? null,
+        "numero"       => $hit['numeroDocumento'] ?? null,
+        "anno"         => $hit['anno'] ?? null,
+        "sala"         => $hit['despacho'] ?? null,
+        "redactor"     => $hit['redactor'] ?? null,
+        "tipo"         => $hit['tipoDocumento'] ?? null,
+        "titulo"       => $hit['title'] ?? null,
+        "resumen"      => $resumen,
+        "descriptores" => $hit['descriptores'] ?? null,
+        "restrictores" => $hit['restrictores'] ?? null,
+        "temas"        => $hit['temasYSubtemas'] ?? [],
+        "fecha"        => $hit['date'] ?? null
+    ];
+}
+
 // -----------------------------------------------------------------------------
 // API ROUTER
 // -----------------------------------------------------------------------------
 
-// Soporte GET / POST JSON
 $request = [];
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $request = $_GET;
@@ -149,8 +146,37 @@ $options = [
     'cookies'  => $request['cookies'] ?? '',
 ];
 
-
+// Ejecuta consulta
 $result = ask_nexusPJv2($q, $page, $size, $options);
 
+if (isset($result['error'])) {
+    echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    exit;
+}
+
+// Keywords (quitamos stopwords)
+$stopwords = ["de","la","el","y","a","en","para","por","un","una","los","las","del","que"];
+$keywords = array_values(array_diff(explode(" ", strtolower($q)), $stopwords));
+
+// Usar directamente hits del Nexus
+$hits = [];
+if (!empty($result['hits'])) {
+    foreach ($result['hits'] as $hit) {
+        $hits[] = normalizarHit($hit, $keywords);
+    }
+}
+
+// Ordenamos por coincidencia
+usort($hits, function($a, $b) {
+    return $b['coincidencia'] <=> $a['coincidencia'];
+});
+
 // Respuesta
-echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+$response = [
+    "query"     => $q,
+    "keywords"  => $keywords,
+    "total"     => $result['total'] ?? count($hits),
+    "hits"      => $hits
+];
+
+echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
