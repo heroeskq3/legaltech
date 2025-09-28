@@ -133,13 +133,22 @@ if (empty($q)) {
     exit;
 }
 
+$facets = $request['facets'] ?? [];
+if (is_string($facets)) {
+    $decoded = json_decode($facets, true);
+    if (json_last_error() === JSON_ERROR_NONE) {
+        $facets = $decoded;
+    }
+}
+
 $options = [
     'nq'       => $request['nq'] ?? '',
     'advanced' => filter_var($request['advanced'] ?? false, FILTER_VALIDATE_BOOLEAN),
-    'facets'   => $request['facets'] ?? [],
+    'facets'   => $facets,
     'exp'      => $request['exp'] ?? '',
     'cookies'  => $request['cookies'] ?? '',
 ];
+
 
 $result = ask_nexusPJv2($q, $page, $size, $options);
 
