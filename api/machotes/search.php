@@ -3,7 +3,6 @@
 // API REST Buscador de Machotes Jurídicos (dinámico con ranking y stopwords)
 // =====================================
 
-// Cabeceras
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Origin: *");
 
@@ -38,7 +37,7 @@ if (empty($q)) {
 }
 $q = strtolower($q);
 
-// Stopwords en español (puedes ampliar la lista)
+// Stopwords en español
 $stopwords = [
     "de","la","el","los","las","un","una","unos","unas",
     "para","por","con","sin","y","o","u","que","en","del",
@@ -50,13 +49,13 @@ $keywords = array_filter(explode(" ", $q), function($word) use ($stopwords) {
     return !in_array($word, $stopwords) && strlen($word) > 2;
 });
 
-// Si después de filtrar no queda nada, forzamos a que no rompa
+// Si después de filtrar no queda nada, usamos el query completo
 if (empty($keywords)) {
     $keywords = [$q];
 }
 
 // Función recursiva de búsqueda
-function buscarArchivos($path, $urlBase, $keywords, $categoria = '') {
+function buscarArchivos($path, $urlBase, $keywords, $categoria = '', $baseDir = '') {
     $resultados = [];
 
     foreach (scandir($path) as $item) {
@@ -70,7 +69,8 @@ function buscarArchivos($path, $urlBase, $keywords, $categoria = '') {
                 $fullPath,
                 $itemUrl,
                 $keywords,
-                ($categoria ? $categoria . '/' : '') . $item
+                ($categoria ? $categoria . '/' : '') . $item,
+                $baseDir
             );
             $resultados = array_merge($resultados, $subResultados);
         } elseif (is_file($fullPath)) {
@@ -84,7 +84,11 @@ function buscarArchivos($path, $urlBase, $keywords, $categoria = '') {
             }
 
             if ($score > 0) {
+                // Generar id como ruta relativa al baseDir
+                $id = ltrim(str_replace($baseDir, '', $fullPath), '/');
+
                 $resultados[] = [
+                    "id"            => $id,
                     "nombre"        => pathinfo($item, PATHINFO_FILENAME),
                     "categoria"     => $categoria,
                     "url"           => $itemUrl,
@@ -99,7 +103,7 @@ function buscarArchivos($path, $urlBase, $keywords, $categoria = '') {
 }
 
 // Ejecuta búsqueda
-$resultados = buscarArchivos($baseDir, $baseUrl, $keywords);
+$resultados = buscarArchivos($baseDir, $baseUrl, $keywords, '', $baseDir);
 
 // Ordenar por relevancia avanzada
 usort($resultados, function($a, $b) use ($keywords) {
