@@ -1,1 +1,4 @@
 uploads/
+vendor/
+composer.lock
+composer.json
