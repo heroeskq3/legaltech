@@ -35,5 +35,5 @@ if ($error) {
 }
 
 // Guardar el Excel en disco
-file_put_contents("../../uploads/sicop/sancionados.xlsx", $response);
+file_put_contents("../../uploads/antecedentes/sancionados.xlsx", $response);
 echo "Archivo Excel guardado como sancionados.xlsx\n";
