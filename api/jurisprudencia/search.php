@@ -1,13 +1,20 @@
 <?php
 // =====================================
-// API REST Jurisprudencia CR (con coincidencias y salida estructurada)
+// API REST Jurisprudencia CR
+// Coincidencias únicas + Tokens + Nivel de Consumo + Normativa citada
+// Autor: Herbert Poveda (LegalTech CR)
 // =====================================
 
-// Cabeceras
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST");
 header("Access-Control-Allow-Headers: Content-Type");
+
+// -----------------------------------------------------------------------------
+// CONFIGURACIÓN
+// -----------------------------------------------------------------------------
+$TOKENS_PER_CHAR = 1 / 4; // Aproximación: 1 token = 4 caracteres
+$TOKEN_COST_USD   = 0.00001; // Costo estimado por token (GPT-4-turbo)
 
 // -----------------------------------------------------------------------------
 // FUNCIONES
@@ -66,19 +73,67 @@ function ask_nexusPJv2(string $pregunta, int $page = 1, int $size = 10, array $o
     return $data;
 }
 
-function contarCoincidencias($texto, $palabras) {
-    $count = 0;
-    $texto = strtolower($texto);
-    foreach ($palabras as $p) {
-        if (empty($p)) continue;
-        $count += substr_count($texto, strtolower($p));
-    }
-    return $count;
+/** ---------------- NORMALIZACIÓN Y ANÁLISIS ---------------- */
+
+function normalizar($texto) {
+    $texto = strtolower(strip_tags($texto));
+    $texto = preg_replace('/[^a-záéíóúüñ0-9\s]/u', ' ', $texto);
+    return preg_replace('/\s+/', ' ', trim($texto));
 }
 
+function limpiarStopwords($palabras) {
+    $stopwords = ["de","la","el","y","a","en","para","por","un","una","los","las","del","que","con","se","su","al","lo","sus","es","como","o","u"];
+    return array_values(array_diff($palabras, $stopwords));
+}
+
+function estimarTokens($texto) {
+    global $TOKENS_PER_CHAR;
+    $chars = mb_strlen($texto, 'UTF-8');
+    return (int) round($chars * $TOKENS_PER_CHAR);
+}
+
+function clasificarNivelConsumo($tokens) {
+    if ($tokens < 2000) return "bajo";
+    if ($tokens < 10000) return "medio";
+    if ($tokens < 30000) return "alto";
+    if ($tokens < 50000) return "muy alto";
+    return "crítico";
+}
+
+/** Detecta coincidencias únicas */
+function detectarCoincidencias($texto, $palabras) {
+    $textoNorm = normalizar($texto);
+    $coinciden = [];
+    foreach ($palabras as $p) {
+        if (strlen($p) < 3) continue;
+        if (strpos($textoNorm, $p) !== false) {
+            $coinciden[] = $p;
+        }
+    }
+    $total = count(array_unique($coinciden));
+    return [
+        'total' => $total,
+        'palabras' => array_unique($coinciden),
+        'relevancia' => $total > 0 ? round($total / count($palabras), 2) : 0.0
+    ];
+}
+
+/** Extrae normativa citada */
+function extraerNormativaCitada($texto) {
+    $normas = [];
+    preg_match_all('/(Ley\s+N\.?°?\s?\d+)|(Código\s+[A-ZÁÉÍÓÚa-záéíóú]+)|(Constitución\s+Política)|(Reglamento\s+[A-ZÁÉÍÓÚa-záéíóú]+)/u', $texto, $matches);
+    foreach ($matches[0] as $m) {
+        $normas[] = trim($m);
+    }
+    return array_values(array_unique($normas));
+}
+
+/** Normaliza un resultado del Nexus */
 function normalizarHit($hit, $keywords) {
     $contenido = strip_tags($hit['content'] ?? '');
-    $coincidencias = contarCoincidencias($contenido, $keywords);
+    $analisis = detectarCoincidencias($contenido, $keywords);
+    $tokens = estimarTokens($contenido);
+    $normativa = extraerNormativaCitada($contenido);
 
     $resumen = '';
     if (!empty($hit['highlight']['contenido'][0])) {
@@ -88,7 +143,13 @@ function normalizarHit($hit, $keywords) {
     }
 
     return [
-        "coincidencia" => $coincidencias,
+        "coincidencia" => $analisis['total'],
+        "relevancia"   => $analisis['relevancia'],
+        "palabras_coinciden" => $analisis['palabras'],
+        "tokens_estimados" => $tokens,
+        "nivel_consumo_tokens" => clasificarNivelConsumo($tokens),
+        "costo_estimado_usd" => round($tokens * $GLOBALS['TOKEN_COST_USD'], 4),
+        "normativa_citada" => $normativa,
         "url"          => isset($hit['idDocument']) ? "https://nexuspj.poder-judicial.go.cr/document/" . $hit['idDocument'] : null,
         "expediente"   => $hit['expediente'] ?? null,
         "numero"       => $hit['numeroDocumento'] ?? null,
@@ -98,9 +159,6 @@ function normalizarHit($hit, $keywords) {
         "tipo"         => $hit['tipoDocumento'] ?? null,
         "titulo"       => $hit['title'] ?? null,
         "resumen"      => $resumen,
-        "descriptores" => $hit['descriptores'] ?? null,
-        "restrictores" => $hit['restrictores'] ?? null,
-        "temas"        => $hit['temasYSubtemas'] ?? [],
         "fecha"        => $hit['date'] ?? null
     ];
 }
@@ -108,7 +166,6 @@ function normalizarHit($hit, $keywords) {
 // -----------------------------------------------------------------------------
 // API ROUTER
 // -----------------------------------------------------------------------------
-
 $request = [];
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $request = $_GET;
@@ -130,20 +187,11 @@ if (empty($q)) {
     exit;
 }
 
-$facets = $request['facets'] ?? [];
-if (is_string($facets)) {
-    $decoded = json_decode($facets, true);
-    if (json_last_error() === JSON_ERROR_NONE) {
-        $facets = $decoded;
-    }
-}
-
 $options = [
     'nq'       => $request['nq'] ?? '',
     'advanced' => filter_var($request['advanced'] ?? false, FILTER_VALIDATE_BOOLEAN),
-    'facets'   => $facets,
+    'facets'   => [],
     'exp'      => $request['exp'] ?? '',
-    'cookies'  => $request['cookies'] ?? '',
 ];
 
 // Ejecuta consulta
@@ -154,29 +202,40 @@ if (isset($result['error'])) {
     exit;
 }
 
-// Keywords (quitamos stopwords)
-$stopwords = ["de","la","el","y","a","en","para","por","un","una","los","las","del","que"];
-$keywords = array_values(array_diff(explode(" ", strtolower($q)), $stopwords));
+// Palabras clave
+$keywords = limpiarStopwords(explode(" ", strtolower($q)));
 
-// Usar directamente hits del Nexus
+// Procesar resultados
 $hits = [];
+$totalTokens = 0;
+$totalCosto = 0;
+
 if (!empty($result['hits'])) {
     foreach ($result['hits'] as $hit) {
-        $hits[] = normalizarHit($hit, $keywords);
+        $h = normalizarHit($hit, $keywords);
+        $totalTokens += $h['tokens_estimados'];
+        $totalCosto += $h['costo_estimado_usd'];
+        $hits[] = $h;
     }
 }
 
-// Ordenamos por coincidencia
-usort($hits, function($a, $b) {
-    return $b['coincidencia'] <=> $a['coincidencia'];
-});
+// Ordenar por relevancia
+usort($hits, fn($a, $b) => $b['relevancia'] <=> $a['relevancia']);
 
-// Respuesta
+$nivelTotal = clasificarNivelConsumo($totalTokens);
+
+// -----------------------------------------------------------------------------
+// SALIDA FINAL
+// -----------------------------------------------------------------------------
 $response = [
-    "query"     => $q,
-    "keywords"  => $keywords,
-    "total"     => $result['total'] ?? count($hits),
-    "hits"      => $hits
+    "query"                 => $q,
+    "keywords"              => $keywords,
+    "total_resultados"      => count($hits),
+    "tokens_total_consulta" => $totalTokens,
+    "nivel_consumo_total"   => $nivelTotal,
+    "costo_estimado_usd"    => round($totalCosto, 4),
+    "hits"                  => $hits
 ];
 
 echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+?>
