@@ -1,7 +1,7 @@
 <?php
 // ==========================================================
 // API LOCAL DE CONSULTA DE LEYES Y CÓDIGOS CR
-// Pirámide de Kelsen + Coincidencias + Tokens + Detección de Ley y Artículo
+// Pirámide de Kelsen + Coincidencias + Tokens + Detección de Ley y Artículo + Modo Compacto
 // Autor: Herbert Poveda (LegalTech CR)
 // ==========================================================
 
@@ -15,7 +15,9 @@ $MAX_RESULTS_PER_LEVEL = 5;
 $RESUMEN_LONG = 400;
 $TOKENS_PER_CHAR = 1 / 4; // 1 token ≈ 4 caracteres
 
-// ---------------- FUNCIONES BASE ----------------
+// ==========================================================
+// FUNCIONES BASE
+// ==========================================================
 function normalizar($texto) {
     $texto = mb_strtolower($texto, 'UTF-8');
     $texto = preg_replace('/[^a-záéíóúüñ0-9\s]/u', ' ', $texto);
@@ -90,25 +92,23 @@ function agruparPorKelsen($resultados) {
     return array_values($grupos);
 }
 
-// ---------------- DETECCIÓN DE CONSULTA ----------------
+// ==========================================================
+// DETECCIÓN DE LEY Y ARTÍCULO
+// ==========================================================
 function detectarConsulta($q) {
     $articulo = null;
     $ley = null;
 
-    if (preg_match('/art(í?culo|\.?)\s*(\d{1,3})/iu', $q, $m)) {
-        $articulo = (int)$m[2];
-    }
-
-    if (preg_match('/ley\s*(n\.?|no\.?)?\s*([0-9]{3,5})/iu', $q, $m)) {
-        $ley = $m[2];
-    } elseif (preg_match('/(constituci[oó]n|forestal|notarial|protecci[oó]n de datos|inder|aguas|jurisdicci[oó]n agraria)/iu', $q, $m)) {
-        $ley = trim($m[1]);
-    }
+    if (preg_match('/art(í?culo|\.?)\s*(\d{1,3})/iu', $q, $m)) $articulo = (int)$m[2];
+    if (preg_match('/ley\s*(n\.?|no\.?)?\s*([0-9]{3,5})/iu', $q, $m)) $ley = $m[2];
+    elseif (preg_match('/(constituci[oó]n|forestal|notarial|protecci[oó]n de datos|inder|aguas|jurisdicci[oó]n agraria)/iu', $q, $m)) $ley = trim($m[1]);
 
     return ['articulo' => $articulo, 'ley' => $ley];
 }
 
-// ---------------- BÚSQUEDA ----------------
+// ==========================================================
+// BÚSQUEDA
+// ==========================================================
 function buscarCoincidencias($query, $materia, $index, $articulo = null, $ley = null) {
     $palabras = filtrarStopwords(explode(' ', normalizar($query ?? '')));
     $resultados = [];
@@ -120,19 +120,17 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $ley = 
 
         $texto = $item['texto'] ?? '';
         $analisis = analizarCoincidencias($texto, $palabras);
-
         if ($analisis['total'] > 0 || $articulo || $ley) {
             $tokens = estimarTokens($texto);
             $resultados[] = [
                 'materia' => $item['materia'] ?? 'general',
                 'codigo' => $item['codigo'] ?? 'Desconocido',
                 'articulo' => $item['articulo'] ?? '',
-                'texto_completo' => trim($texto),
                 'resumen' => crearResumen($texto, $GLOBALS['RESUMEN_LONG']),
+                'texto_completo' => trim($texto),
                 'nivel_kelsen' => $item['nivel_kelsen'] ?? 99,
                 'jerarquia_nombre' => $item['jerarquia_nombre'] ?? 'Desconocido',
                 'coincidencia' => $analisis['total'],
-                'coincidencias_palabras' => $analisis['palabras'],
                 'tokens_estimados' => $tokens,
                 'nivel_consumo_tokens' => nivelConsumoTokens($tokens),
                 'supletoria' => $item['supletoria'] ?? []
@@ -143,12 +141,15 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $ley = 
     return $resultados;
 }
 
-// ---------------- ENTRADA ----------------
+// ==========================================================
+// ENTRADA
+// ==========================================================
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $q = $_GET['q'] ?? null;
     $materia = $_GET['materia'] ?? null;
     $leyParam = $_GET['ley'] ?? null;
     $artParam = $_GET['articulo'] ?? null;
+    $mode = $_GET['mode'] ?? 'full';
 } else {
     $raw = file_get_contents("php://input");
     $data = json_decode($raw, true);
@@ -156,6 +157,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $materia = $data['materia'] ?? null;
     $leyParam = $data['ley'] ?? null;
     $artParam = $data['articulo'] ?? null;
+    $mode = $data['mode'] ?? 'full';
 }
 
 if (!file_exists($DATA_PATH)) {
@@ -171,65 +173,87 @@ if (!$index) {
     exit;
 }
 
-// ---------------- DETECCIÓN AUTOMÁTICA ----------------
 $det = detectarConsulta($q ?? '');
 $ley = $leyParam ?? $det['ley'];
 $articulo = $artParam ?? $det['articulo'];
-
-// ---------------- PROCESAMIENTO ----------------
 $resultados = buscarCoincidencias($q, $materia, $index, $articulo, $ley);
 
-// ---- MODO DIRECTO (ley + artículo) ----
+// ==========================================================
+// MODO COMPACTO Y ESPECÍFICO
+// ==========================================================
 if ($ley && $articulo) {
-    if (count($resultados) > 0) {
-        $r = $resultados[0];
-        echo json_encode([
-            'consulta' => $q ?? "Ley: $ley / Artículo: $articulo",
-            'ley_detectada' => $ley,
-            'articulo_detectado' => $articulo,
-            'texto_completo' => $r['texto_completo'],
-            'resumen' => $r['resumen'],
-            'nivel_kelsen' => $r['nivel_kelsen'],
-            'jerarquia_nombre' => $r['jerarquia_nombre'],
-            'tokens_estimados' => $r['tokens_estimados'],
-            'nivel_consumo_tokens' => $r['nivel_consumo_tokens'],
-            'materia' => $r['materia'],
-            'codigo' => $r['codigo'],
-            'supletoria' => $r['supletoria']
-        ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-    } else {
-        echo json_encode([
-            'consulta' => $q ?? "Ley: $ley / Artículo: $articulo",
-            'ley_detectada' => $ley,
-            'articulo_detectado' => $articulo,
-            'error' => 'No se encontró ese artículo en la ley indicada.'
-        ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-    }
+    $r = $resultados[0] ?? null;
+    echo json_encode($r ? [
+        'consulta' => $q ?? "Ley: $ley / Artículo: $articulo",
+        'ley_detectada' => $ley,
+        'articulo_detectado' => $articulo,
+        'texto_completo' => $r['texto_completo'],
+        'resumen' => $r['resumen'],
+        'nivel_kelsen' => $r['nivel_kelsen'],
+        'jerarquia_nombre' => $r['jerarquia_nombre'],
+        'tokens_estimados' => $r['tokens_estimados'],
+        'nivel_consumo_tokens' => $r['nivel_consumo_tokens'],
+        'materia' => $r['materia'],
+        'codigo' => $r['codigo'],
+        'supletoria' => $r['supletoria']
+    ] : ['error' => 'No se encontró el artículo solicitado.'], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     exit;
 }
 
-// ---- MODO GENERAL ----
 $niveles = agruparPorKelsen($resultados);
-$resumen = [];
-$totalTokens = 0;
-foreach ($niveles as $n) {
-    $resumen[] = [
-        'nivel_kelsen' => $n['nivel_kelsen'],
-        'jerarquia_nombre' => $n['jerarquia_nombre'],
-        'total' => $n['total'],
-        'tokens_total_nivel' => $n['tokens_total_nivel'],
-        'nivel_consumo_tokens' => $n['nivel_consumo_tokens']
-    ];
-    $totalTokens += $n['tokens_total_nivel'];
+$totalTokens = array_sum(array_column($niveles, 'tokens_total_nivel'));
+
+// === Modo compacto o resumen ===
+if ($mode === 'compact') {
+    $compact = [];
+    foreach ($niveles as $n) {
+        $compact[] = [
+            'nivel_kelsen' => $n['nivel_kelsen'],
+            'jerarquia_nombre' => $n['jerarquia_nombre'],
+            'total' => $n['total'],
+            'nivel_consumo_tokens' => $n['nivel_consumo_tokens'],
+            'resultados' => array_map(fn($r) => [
+                'codigo' => $r['codigo'],
+                'articulo' => $r['articulo'],
+                'resumen' => $r['resumen'],
+                'coincidencia' => $r['coincidencia'],
+                'tokens_estimados' => $r['tokens_estimados']
+            ], $n['resultados'])
+        ];
+    }
+
+    echo json_encode([
+        'consulta' => $q,
+        'modo' => 'compact',
+        'materia_consultada' => $materia ?? 'no especificada',
+        'total_encontrados' => count($resultados),
+        'tokens_total_consulta' => $totalTokens,
+        'nivel_consumo_total' => nivelConsumoTokens($totalTokens),
+        'niveles_compactos' => $compact
+    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    exit;
 }
 
+// === Modo summary ===
+if ($mode === 'summary') {
+    echo json_encode([
+        'consulta' => $q,
+        'modo' => 'summary',
+        'total_encontrados' => count($resultados),
+        'tokens_total_consulta' => $totalTokens,
+        'nivel_consumo_total' => nivelConsumoTokens($totalTokens)
+    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    exit;
+}
+
+// === Modo full ===
 echo json_encode([
-    'consulta' => $q ?? "Consulta general",
+    'consulta' => $q,
+    'modo' => 'full',
     'materia_consultada' => $materia ?? 'no especificada',
     'total_encontrados' => count($resultados),
     'tokens_total_consulta' => $totalTokens,
     'nivel_consumo_total' => nivelConsumoTokens($totalTokens),
-    'resumen_por_nivel' => $resumen,
     'niveles' => $niveles
 ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
 ?>
