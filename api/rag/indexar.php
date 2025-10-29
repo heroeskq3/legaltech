@@ -1,7 +1,8 @@
 <?php
 // =====================================================
 // INDEXADOR PIRÁMIDE DE KELSEN MULTI-MATERIA Y SUPLETORIEDAD
-// Detecta materia correctamente (agrario, notarial, etc.)
+// Incluye NIVEL 0 (Índices y Flujos Normativos)
+// Detecta materia correctamente (agrario, notarial, penal, etc.)
 // Compatible con macOS/XAMPP — UTF-8 Seguro
 // Autor: Herbert Poveda (LegalTech CR)
 // =====================================================
@@ -39,6 +40,7 @@ function asegurar_utf8($str) {
  */
 function obtenerJerarquia($dirName) {
     $map = [
+        '0_' => 'Índices y Flujos Normativos',
         '1_' => 'Tratado o Derecho Internacional',
         '2_' => 'Constitución Política',
         '3_' => 'Ley Orgánica',
@@ -48,7 +50,7 @@ function obtenerJerarquia($dirName) {
         '7_' => 'Ley Supletoria',
         '8_' => 'Decreto / Reglamento',
         '9_' => 'Manual / Doctrina',
-        '10_' => 'Resolución'
+        '10_' => 'Resolución / Jurisprudencia'
     ];
     foreach ($map as $prefix => $nombre) {
         if (strpos($dirName, $prefix) === 0) {
@@ -62,8 +64,7 @@ function obtenerJerarquia($dirName) {
 }
 
 /**
- * Escanea recursivamente las carpetas de leyes,
- * detectando materia raíz (agrario, notarial, etc.)
+ * Escanea recursivamente las carpetas de leyes
  */
 function recorrerCarpetas($path, &$lista, $materiaRaiz = null, $nivelActual = null) {
     foreach (scandir($path) as $i) {
@@ -71,7 +72,7 @@ function recorrerCarpetas($path, &$lista, $materiaRaiz = null, $nivelActual = nu
         $ruta = "$path/$i";
 
         if (is_dir($ruta)) {
-            // Si estamos justo debajo de /leyes/, el nombre del subdirectorio es la materia
+            // Detecta materia (nivel raíz)
             $nivelBase = basename(dirname($ruta));
             if ($nivelBase === basename(realpath(__DIR__ . '/../../uploads/leyes'))) {
                 $materiaRaiz = strtolower($i);
@@ -105,17 +106,45 @@ function obtenerSupletorias($materia) {
 }
 
 /**
- * Indexa los artículos de cada archivo
+ * Indexa los artículos o bloques de cada archivo
  */
 function indexarArchivo($archivo, $materia, $nivelKelsen, $jerarquiaNombre, &$index, $EOL) {
     $nombre = pathinfo($archivo, PATHINFO_FILENAME);
     $texto = @file_get_contents($archivo);
+
     if (!$texto || strlen(trim($texto)) < 20) {
         echo "⚠️  Vacío: $archivo{$EOL}";
         return;
     }
 
     $texto = asegurar_utf8($texto);
+
+    // === Nivel 0 (Índices y Flujos) ===
+    if ($nivelKelsen === 0) {
+        $bloques = preg_split("/(\r?\n){2,}/", $texto); // divide por párrafos
+        $prev = count($index);
+
+        foreach ($bloques as $i => $b) {
+            $b = asegurar_utf8(normalizar($b));
+            if (strlen($b) < 40) continue;
+
+            $index[] = [
+                'materia' => strtolower($materia),
+                'codigo' => asegurar_utf8($nombre),
+                'tipo' => 'indice',
+                'bloque' => $i + 1,
+                'texto' => $b,
+                'nivel_kelsen' => $nivelKelsen,
+                'jerarquia_nombre' => $jerarquiaNombre,
+                'supletoria' => obtenerSupletorias($materia)
+            ];
+        }
+
+        echo "✅ $nombre → " . (count($index) - $prev) . " bloques (Nivel 0 - Índice | Materia: $materia){$EOL}";
+        return;
+    }
+
+    // === Niveles 1–10 ===
     $bloques = preg_split("/(Artículo|ARTÍCULO|Art\.?)\s+\d+\.?/", $texto);
     preg_match_all("/(Artículo|ARTÍCULO|Art\.?)\s+(\d+)/", $texto, $nums);
 
@@ -173,7 +202,7 @@ foreach ($archivos as $a) {
     );
 }
 
-echo "{$EOL}🧮 Total artículos indexados: " . count($index) . "{$EOL}";
+echo "{$EOL}🧮 Total registros indexados: " . count($index) . "{$EOL}";
 
 // =====================================================
 // GUARDAR JSON SEGURO
