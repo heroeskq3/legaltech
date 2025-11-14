@@ -14,6 +14,14 @@ $DATA_PATH = __DIR__ . '/../../uploads/leyes/vector_leyes.json';
 $MAX_RESULTS_PER_LEVEL = 5;
 $RESUMEN_LONG = 400;
 $TOKENS_PER_CHAR = 1 / 4; // 1 token ≈ 4 caracteres
+$DEFAULT_FULL_TOKEN_LIMIT = 20000; // evita respuestas enormes por defecto
+$SIZE_WARNING_BYTES = 512 * 1024; // ~500 KB
+$RECOMENDACIONES_BASE = [
+    'Divide la carga por tratado o bloque temático (CADH, PIDCP, CEDAW, etc.).',
+    'Usa mode=compact o mode=index para obtener solo el esqueleto jerárquico.',
+    'Solicita artículos específicos con los parámetros codigo/tratado + articulo.',
+    'Guarda cada bloque localmente para hacer carga incremental sin agotar memoria.'
+];
 
 // ==========================================================
 // FUNCIONES BASE
@@ -62,7 +70,14 @@ function nivelConsumoTokens($tokens) {
     return 'crítico';
 }
 
-function agruparPorKelsen($resultados) {
+function agregarMensajeUnico(&$lista, $mensaje) {
+    if (!in_array($mensaje, $lista, true)) {
+        $lista[] = $mensaje;
+    }
+}
+
+function agruparPorKelsen($resultados, $maxPorNivel = null) {
+    $maxPorNivel = $maxPorNivel ?: ($GLOBALS['MAX_RESULTS_PER_LEVEL'] ?? 5);
     $grupos = [];
     foreach ($resultados as $r) {
         $nivel = $r['nivel_kelsen'] ?? 99;
@@ -84,12 +99,59 @@ function agruparPorKelsen($resultados) {
 
     foreach ($grupos as &$g) {
         usort($g['resultados'], fn($a, $b) => $b['coincidencia'] <=> $a['coincidencia']);
-        $g['resultados'] = array_slice($g['resultados'], 0, $GLOBALS['MAX_RESULTS_PER_LEVEL']);
+        $g['resultados'] = array_slice($g['resultados'], 0, $maxPorNivel);
         $g['total'] = count($g['resultados']);
         $g['nivel_consumo_tokens'] = nivelConsumoTokens($g['tokens_total_nivel']);
     }
 
     return array_values($grupos);
+}
+
+function limitarNivelesPorTokens($niveles, $maxTokens = null) {
+    if (!$maxTokens || $maxTokens <= 0) {
+        $total = 0;
+        foreach ($niveles as $nivel) {
+            $total += $nivel['tokens_total_nivel'] ?? 0;
+        }
+        return [$niveles, false, $total];
+    }
+
+    $nivelesLimitados = [];
+    $tokensUsados = 0;
+    $truncado = false;
+
+    foreach ($niveles as $nivel) {
+        $nivelTmp = $nivel;
+        $nivelTmp['resultados'] = [];
+        $nivelTokens = 0;
+
+        foreach ($nivel['resultados'] as $res) {
+            $tokensRes = $res['tokens_estimados'] ?? 0;
+            if ($tokensUsados + $tokensRes > $maxTokens) {
+                $truncado = true;
+                if ($nivelTmp['resultados']) {
+                    $nivelTmp['tokens_total_nivel'] = $nivelTokens;
+                    $nivelTmp['total'] = count($nivelTmp['resultados']);
+                    $nivelTmp['nivel_consumo_tokens'] = nivelConsumoTokens($nivelTokens);
+                    $nivelesLimitados[] = $nivelTmp;
+                }
+                return [$nivelesLimitados, $truncado, $tokensUsados];
+            }
+
+            $nivelTmp['resultados'][] = $res;
+            $nivelTokens += $tokensRes;
+            $tokensUsados += $tokensRes;
+        }
+
+        if ($nivelTmp['resultados']) {
+            $nivelTmp['tokens_total_nivel'] = $nivelTokens;
+            $nivelTmp['total'] = count($nivelTmp['resultados']);
+            $nivelTmp['nivel_consumo_tokens'] = nivelConsumoTokens($nivelTokens);
+            $nivelesLimitados[] = $nivelTmp;
+        }
+    }
+
+    return [$nivelesLimitados, $truncado, $tokensUsados];
 }
 
 // ==========================================================
@@ -102,6 +164,30 @@ function detectarConsulta($q) {
     if (preg_match('/art(í?culo|\.?)\s*(\d{1,3})/iu', $q, $m)) $articulo = (int)$m[2];
     if (preg_match('/ley\s*(n\.?|no\.?)?\s*([0-9]{3,5})/iu', $q, $m)) $ley = $m[2];
     elseif (preg_match('/(constituci[oó]n|forestal|notarial|protecci[oó]n de datos|inder|aguas|jurisdicci[oó]n agraria)/iu', $q, $m)) $ley = trim($m[1]);
+    else {
+        $tratados = [
+            'convención americana sobre derechos humanos',
+            'convencion americana sobre derechos humanos',
+            'pacto internacional de derechos civiles y politicos',
+            'pacto internacional de derechos civiles y políticos',
+            'pacto internacional de derechos economicos, sociales y culturales',
+            'pacto internacional de derechos económicos, sociales y culturales',
+            'convención contra la tortura',
+            'convencion contra la tortura',
+            'cedaw',
+            'convención sobre los derechos del niño',
+            'convencion sobre los derechos del niño',
+            'acuerdo de escazú',
+            'acuerdo de escazu'
+        ];
+
+        foreach ($tratados as $t) {
+            if (stripos($q, $t) !== false) {
+                $ley = $t;
+                break;
+            }
+        }
+    }
 
     return ['articulo' => $articulo, 'ley' => $ley];
 }
@@ -109,25 +195,28 @@ function detectarConsulta($q) {
 // ==========================================================
 // BÚSQUEDA
 // ==========================================================
-function buscarCoincidencias($query, $materia, $index, $articulo = null, $ley = null) {
+function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigoFiltro = null, $incluirTextoCompleto = true) {
     $palabras = filtrarStopwords(explode(' ', normalizar($query ?? '')));
     $resultados = [];
 
     foreach ($index as $item) {
         if ($materia && strtolower($item['materia']) !== strtolower($materia)) continue;
-        if ($ley && stripos($item['codigo'], $ley) === false) continue;
+        if ($codigoFiltro) {
+            $codigoItem = mb_strtolower($item['codigo'] ?? '', 'UTF-8');
+            $codigoFiltroNorm = mb_strtolower($codigoFiltro, 'UTF-8');
+            if (stripos($codigoItem, $codigoFiltroNorm) === false) continue;
+        }
         if ($articulo && (int)$item['articulo'] !== (int)$articulo) continue;
 
         $texto = $item['texto'] ?? '';
         $analisis = analizarCoincidencias($texto, $palabras);
-        if ($analisis['total'] > 0 || $articulo || $ley) {
+        if ($analisis['total'] > 0 || $articulo || $codigoFiltro) {
             $tokens = estimarTokens($texto);
-            $resultados[] = [
+            $entrada = [
                 'materia' => $item['materia'] ?? 'general',
                 'codigo' => $item['codigo'] ?? 'Desconocido',
                 'articulo' => $item['articulo'] ?? '',
                 'resumen' => crearResumen($texto, $GLOBALS['RESUMEN_LONG']),
-                'texto_completo' => trim($texto),
                 'nivel_kelsen' => $item['nivel_kelsen'] ?? 99,
                 'jerarquia_nombre' => $item['jerarquia_nombre'] ?? 'Desconocido',
                 'coincidencia' => $analisis['total'],
@@ -135,6 +224,10 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $ley = 
                 'nivel_consumo_tokens' => nivelConsumoTokens($tokens),
                 'supletoria' => $item['supletoria'] ?? []
             ];
+            if ($incluirTextoCompleto) {
+                $entrada['texto_completo'] = trim($texto);
+            }
+            $resultados[] = $entrada;
         }
     }
 
@@ -149,6 +242,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $materia = $_GET['materia'] ?? null;
     $leyParam = $_GET['ley'] ?? null;
     $artParam = $_GET['articulo'] ?? null;
+    $codigoParam = $_GET['codigo'] ?? ($_GET['tratado'] ?? null);
+    $maxTokensParam = isset($_GET['max_tokens']) ? (int)$_GET['max_tokens'] : null;
+    $maxPorNivelParam = isset($_GET['max_por_nivel']) ? (int)$_GET['max_por_nivel'] : null;
     $mode = $_GET['mode'] ?? 'full';
 } else {
     $raw = file_get_contents("php://input");
@@ -157,6 +253,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     $materia = $data['materia'] ?? null;
     $leyParam = $data['ley'] ?? null;
     $artParam = $data['articulo'] ?? null;
+    $codigoParam = $data['codigo'] ?? ($data['tratado'] ?? null);
+    $maxTokensParam = isset($data['max_tokens']) ? (int)$data['max_tokens'] : null;
+    $maxPorNivelParam = isset($data['max_por_nivel']) ? (int)$data['max_por_nivel'] : null;
     $mode = $data['mode'] ?? 'full';
 }
 
@@ -173,19 +272,41 @@ if (!$index) {
     exit;
 }
 
+$codigoParam = isset($codigoParam) ? trim($codigoParam ?? '') : null;
+if ($codigoParam === '') $codigoParam = null;
+
 $det = detectarConsulta($q ?? '');
 $ley = $leyParam ?? $det['ley'];
 $articulo = $artParam ?? $det['articulo'];
-$resultados = buscarCoincidencias($q, $materia, $index, $articulo, $ley);
+if (!$ley && $codigoParam) $ley = $codigoParam;
+$codigoFiltro = $codigoParam ?: $ley;
+
+$modeRequested = strtolower($mode ?? 'full');
+$modeAllowed = ['full', 'compact', 'summary', 'index'];
+if (!in_array($modeRequested, $modeAllowed, true)) $modeRequested = 'full';
+$modeEffective = ($modeRequested === 'index') ? 'compact' : $modeRequested;
+$mode = $modeEffective;
+
+$maxPorNivel = ($maxPorNivelParam && $maxPorNivelParam > 0) ? $maxPorNivelParam : $MAX_RESULTS_PER_LEVEL;
+$maxTokensEffective = null;
+if ($maxTokensParam !== null) {
+    $maxTokensEffective = max(0, (int)$maxTokensParam);
+} elseif ($mode === 'full') {
+    $maxTokensEffective = $DEFAULT_FULL_TOKEN_LIMIT;
+}
+
+$incluirTextoCompleto = ($articulo !== null) || $mode === 'full';
+$resultados = buscarCoincidencias($q, $materia, $index, $articulo, $codigoFiltro, $incluirTextoCompleto);
 
 // ==========================================================
 // MODO COMPACTO Y ESPECÍFICO
 // ==========================================================
-if ($ley && $articulo) {
+if ($codigoFiltro && $articulo) {
     $r = $resultados[0] ?? null;
     echo json_encode($r ? [
         'consulta' => $q ?? "Ley: $ley / Artículo: $articulo",
         'ley_detectada' => $ley,
+        'codigo_detectado' => $codigoFiltro,
         'articulo_detectado' => $articulo,
         'texto_completo' => $r['texto_completo'],
         'resumen' => $r['resumen'],
@@ -195,15 +316,46 @@ if ($ley && $articulo) {
         'nivel_consumo_tokens' => $r['nivel_consumo_tokens'],
         'materia' => $r['materia'],
         'codigo' => $r['codigo'],
-        'supletoria' => $r['supletoria']
+        'supletoria' => $r['supletoria'],
+        'recomendaciones' => $RECOMENDACIONES_BASE
     ] : ['error' => 'No se encontró el artículo solicitado.'], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     exit;
 }
 
-$niveles = agruparPorKelsen($resultados);
-$totalTokens = array_sum(array_column($niveles, 'tokens_total_nivel'));
+$nivelesAgrupados = agruparPorKelsen($resultados, $maxPorNivel);
+[$niveles, $truncadoPorTokens, $totalTokens] = limitarNivelesPorTokens($nivelesAgrupados, $maxTokensEffective);
+$warnings = [];
+$recomendaciones = $RECOMENDACIONES_BASE;
+$totalEncontrados = count($resultados);
+$totalEntregados = 0;
+foreach ($niveles as $nivelTmp) {
+    $totalEntregados += $nivelTmp['total'] ?? count($nivelTmp['resultados']);
+}
 
-// === Modo compacto o resumen ===
+$baseResponse = [
+    'consulta' => $q,
+    'modo' => $modeRequested,
+    'modo_ejecutado' => $mode,
+    'materia_consultada' => $materia ?? 'no especificada',
+    'total_encontrados' => $totalEncontrados,
+    'total_entregados' => $totalEntregados,
+    'tokens_total_consulta' => $totalTokens,
+    'nivel_consumo_total' => nivelConsumoTokens($totalTokens),
+    'filtros' => [
+        'materia' => $materia,
+        'ley' => $ley,
+        'codigo' => $codigoFiltro,
+        'articulo' => $articulo,
+        'max_por_nivel' => $maxPorNivel,
+        'max_tokens' => $maxTokensEffective,
+        'limite_tokens_automatico' => ($maxTokensParam === null && $mode === 'full' && $maxTokensEffective)
+    ],
+    'truncado_por_tokens' => $truncadoPorTokens
+];
+
+$response = $baseResponse;
+$bytesEstimados = 0;
+
 if ($mode === 'compact') {
     $compact = [];
     foreach ($niveles as $n) {
@@ -221,39 +373,50 @@ if ($mode === 'compact') {
             ], $n['resultados'])
         ];
     }
-
-    echo json_encode([
-        'consulta' => $q,
-        'modo' => 'compact',
-        'materia_consultada' => $materia ?? 'no especificada',
-        'total_encontrados' => count($resultados),
-        'tokens_total_consulta' => $totalTokens,
-        'nivel_consumo_total' => nivelConsumoTokens($totalTokens),
-        'niveles_compactos' => $compact
-    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-    exit;
+    $compactEncoded = json_encode($compact, JSON_UNESCAPED_UNICODE);
+    $bytesEstimados = $compactEncoded ? strlen($compactEncoded) : 0;
+    $response['modo_estructura'] = ($modeRequested === 'index') ? 'index' : 'compact';
+    $response['niveles_compactos'] = $compact;
+} elseif ($mode === 'summary') {
+    $response['modo_estructura'] = 'summary';
+} else {
+    $nivelesEncoded = json_encode($niveles, JSON_UNESCAPED_UNICODE);
+    $bytesEstimados = $nivelesEncoded ? strlen($nivelesEncoded) : 0;
+    $response['modo_estructura'] = 'full';
+    $response['niveles'] = $niveles;
 }
 
-// === Modo summary ===
-if ($mode === 'summary') {
-    echo json_encode([
-        'consulta' => $q,
-        'modo' => 'summary',
-        'total_encontrados' => count($resultados),
-        'tokens_total_consulta' => $totalTokens,
-        'nivel_consumo_total' => nivelConsumoTokens($totalTokens)
-    ], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-    exit;
+if ($truncadoPorTokens) {
+    agregarMensajeUnico($warnings, 'La respuesta se recortó al alcanzar el límite de tokens configurado.');
 }
 
-// === Modo full ===
-echo json_encode([
-    'consulta' => $q,
-    'modo' => 'full',
-    'materia_consultada' => $materia ?? 'no especificada',
-    'total_encontrados' => count($resultados),
-    'tokens_total_consulta' => $totalTokens,
-    'nivel_consumo_total' => nivelConsumoTokens($totalTokens),
-    'niveles' => $niveles
-], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+if ($totalEntregados < $totalEncontrados) {
+    agregarMensajeUnico($warnings, "Se entregaron $totalEntregados de $totalEncontrados resultados (max_por_nivel = $maxPorNivel).");
+}
+
+if (!$codigoFiltro) {
+    agregarMensajeUnico($warnings, 'No se detectó un tratado/código específico; la respuesta agrupa múltiples instrumentos.');
+}
+
+if (!$articulo && $mode === 'full') {
+    agregarMensajeUnico($recomendaciones, 'Solicita los artículos de manera incremental usando los parámetros codigo/tratado + articulo.');
+}
+
+if ($mode === 'full' && $bytesEstimados > $SIZE_WARNING_BYTES) {
+    agregarMensajeUnico($warnings, 'El cuerpo devuelto supera los ~500 KB. Cambia a mode=compact o carga artículos individuales.');
+}
+
+if ($modeRequested === 'index') {
+    agregarMensajeUnico($warnings, 'mode=index responde en formato compacto para evitar texto íntegro y errores ResponseTooLarge.');
+}
+
+if ($maxTokensParam === null && $mode === 'full' && $maxTokensEffective) {
+    agregarMensajeUnico($warnings, "Se aplicó un límite automático de {$maxTokensEffective} tokens. Define max_tokens=0 para desactivarlo.");
+}
+
+$response['warnings'] = $warnings;
+$response['recomendaciones'] = array_values(array_unique($recomendaciones));
+$response['estimado_bytes_carga'] = $bytesEstimados;
+
+echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
 ?>
