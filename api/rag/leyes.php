@@ -3,6 +3,7 @@
 // API LOCAL DE CONSULTA DE LEYES Y CÓDIGOS CR
 // Pirámide de Kelsen + Coincidencias + Tokens + Detección de Ley y Artículo + Modo Compacto
 // Autor: Herbert Poveda (LegalTech CR)
+// Versión corregida: v1.9.1 (Soporte de rango, artículos múltiples, nombres flexibles)
 // ==========================================================
 
 header("Content-Type: application/json; charset=UTF-8");
@@ -15,7 +16,6 @@ $MAX_RESULTS_PER_LEVEL = 5;
 $RESUMEN_LONG = 400;
 $TOKENS_PER_CHAR = 1 / 4;
 $DEFAULT_FULL_TOKEN_LIMIT = 20000;
-$SIZE_WARNING_BYTES = 512 * 1024;
 $RECOMENDACIONES_BASE = [
     'Divide la carga por tratado o bloque temático (CADH, PIDCP, CEDAW, etc.).',
     'Usa mode=compact o mode=index para obtener solo el esqueleto jerárquico.',
@@ -139,31 +139,28 @@ function limitarNivelesPorTokens($niveles, $maxTokens = null) {
 }
 
 // ==========================================================
-// DETECCIÓN DE LEY Y ARTÍCULO
+// DETECCIÓN DE LEY Y ARTÍCULO (con soporte de rango y sin q)
 // ==========================================================
 function detectarConsulta($q) {
     $articulo = null; $rango = null; $ley = null;
 
-    // ⚙️ FIX: detectar rango tipo “artículos 1–5” o “arts. 3 a 7”
-    if (preg_match('/art(í?culos?|\.?)\s*(\d+)\s*[-a–]\s*(\d+)/iu', $q, $m)) {
-        $rango = [(int)$m[2], (int)$m[3]];
+    if (preg_match('/(\d+)\s*[-a–]\s*(\d+)/u', $q, $m)) {
+        $rango = [(int)$m[1], (int)$m[2]];
     } elseif (preg_match('/art(í?culo|\.?)\s*(\d{1,3})/iu', $q, $m)) {
         $articulo = (int)$m[2];
     }
 
-    if (preg_match('/ley\s*(n\.?|no\.?)?\s*([0-9]{3,5})/iu', $q, $m)) $ley = $m[2];
-    elseif (preg_match('/(constituci[oó]n|jurisdicci[oó]n|forestal|notarial|inder|aguas)/iu', $q, $m)) $ley = trim($m[1]);
-    else {
-        $tratados = [
-            'convención americana sobre derechos humanos',
-            'pacto internacional de derechos civiles y políticos',
-            'pacto internacional de derechos económicos, sociales y culturales',
-            'convención contra la tortura',
-            'cedaw',
-            'convención sobre los derechos del niño',
-            'acuerdo de escazú'
-        ];
-        foreach ($tratados as $t) if (stripos($q, $t) !== false) { $ley = $t; break; }
+    $nombres = [
+        'convención americana sobre derechos humanos',
+        'pacto de san josé',
+        'pacto internacional de derechos civiles y políticos',
+        'pacto internacional de derechos económicos, sociales y culturales',
+        'convención contra la tortura',
+        'cedaw',
+        'convención sobre los derechos del niño'
+    ];
+    foreach ($nombres as $t) {
+        if (stripos($q, $t) !== false) { $ley = $t; break; }
     }
     return ['articulo' => $articulo, 'rango' => $rango, 'ley' => $ley];
 }
@@ -177,35 +174,34 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigo
 
     foreach ($index as $item) {
         if ($materia && strtolower($item['materia']) !== strtolower($materia)) continue;
+
         if ($codigoFiltro) {
             $codigoItem = mb_strtolower($item['codigo'] ?? '', 'UTF-8');
             $codigoFiltroNorm = mb_strtolower($codigoFiltro, 'UTF-8');
-            if (stripos($codigoItem, $codigoFiltroNorm) === false) continue;
+            if (stripos($codigoItem, $codigoFiltroNorm) === false &&
+                stripos(mb_strtolower($item['nombre'] ?? '', 'UTF-8'), $codigoFiltroNorm) === false) continue;
         }
 
-        // ⚙️ FIX: admitir rango de artículos
-        if ($rango && isset($item['articulo'])) {
-            if ((int)$item['articulo'] < $rango[0] || (int)$item['articulo'] > $rango[1]) continue;
-        } elseif ($articulo && (int)$item['articulo'] !== (int)$articulo) continue;
+        $numArt = (int)($item['articulo'] ?? 0);
+        if ($rango && ($numArt < $rango[0] || $numArt > $rango[1])) continue;
+        if ($articulo && $numArt !== (int)$articulo) continue;
 
         $texto = $item['texto'] ?? '';
         $analisis = analizarCoincidencias($texto, $palabras);
-        if ($analisis['total'] > 0 || $articulo || $codigoFiltro || $rango) {
+        if ($analisis['total'] > 0 || $articulo || $rango || $codigoFiltro) {
             $tokens = estimarTokens($texto);
-            $entrada = [
+            $resultados[] = [
                 'materia' => $item['materia'] ?? 'general',
                 'codigo' => $item['codigo'] ?? 'Desconocido',
                 'articulo' => $item['articulo'] ?? '',
                 'resumen' => crearResumen($texto, $GLOBALS['RESUMEN_LONG']),
                 'nivel_kelsen' => $item['nivel_kelsen'] ?? 99,
                 'jerarquia_nombre' => $item['jerarquia_nombre'] ?? 'Desconocido',
-                'coincidencia' => $analisis['total'],
+                'coincidencia' => max(1, $analisis['total']),
                 'tokens_estimados' => $tokens,
                 'nivel_consumo_tokens' => nivelConsumoTokens($tokens),
-                'supletoria' => $item['supletoria'] ?? []
+                'texto_completo' => $incluirTextoCompleto ? trim($texto) : null
             ];
-            if ($incluirTextoCompleto) $entrada['texto_completo'] = trim($texto);
-            $resultados[] = $entrada;
         }
     }
     return $resultados;
@@ -215,26 +211,20 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigo
 // ENTRADA
 // ==========================================================
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-    $q = $_GET['q'] ?? null;
-    $materia = $_GET['materia'] ?? null;
-    $leyParam = $_GET['ley'] ?? null;
-    $artParam = $_GET['articulo'] ?? null;
-    $codigoParam = $_GET['codigo'] ?? ($_GET['tratado'] ?? null);
-    $maxTokensParam = isset($_GET['max_tokens']) ? (int)$_GET['max_tokens'] : null;
-    $maxPorNivelParam = isset($_GET['max_por_nivel']) ? (int)$_GET['max_por_nivel'] : null;
-    $mode = $_GET['mode'] ?? 'full';
+    $params = $_GET;
 } else {
-    $raw = file_get_contents("php://input");
-    $data = json_decode($raw, true);
-    $q = $data['q'] ?? null;
-    $materia = $data['materia'] ?? null;
-    $leyParam = $data['ley'] ?? null;
-    $artParam = $data['articulo'] ?? null;
-    $codigoParam = $data['codigo'] ?? ($data['tratado'] ?? null);
-    $maxTokensParam = isset($data['max_tokens']) ? (int)$data['max_tokens'] : null;
-    $maxPorNivelParam = isset($data['max_por_nivel']) ? (int)$data['max_por_nivel'] : null;
-    $mode = $data['mode'] ?? 'full';
+    $params = json_decode(file_get_contents("php://input"), true) ?? [];
 }
+
+$q = $params['q'] ?? null;
+$materia = $params['materia'] ?? null;
+$leyParam = $params['ley'] ?? null;
+$artParam = $params['articulo'] ?? null;
+$rangoParam = $params['rango'] ?? null;
+$codigoParam = $params['codigo'] ?? ($params['tratado'] ?? null);
+$maxTokensParam = isset($params['max_tokens']) ? (int)$params['max_tokens'] : null;
+$maxPorNivelParam = isset($params['max_por_nivel']) ? (int)$params['max_por_nivel'] : null;
+$mode = $params['mode'] ?? 'full';
 
 if (!file_exists($DATA_PATH)) {
     http_response_code(500);
@@ -251,9 +241,12 @@ if (!$index) {
 $det = detectarConsulta($q ?? '');
 $ley = $leyParam ?? $det['ley'];
 $articulo = $artParam ?? $det['articulo'];
-$rango = $det['rango'] ?? null;
-$codigoFiltro = ($codigoParam ?: $ley);
+$rango = $rangoParam ?: $det['rango'];
+if ($artParam && preg_match('/(\d+)\s*[-a–]\s*(\d+)/u', $artParam, $m)) {
+    $rango = [(int)$m[1], (int)$m[2]];
+}
 
+$codigoFiltro = ($codigoParam ?: $ley);
 $modeRequested = strtolower($mode ?? 'full');
 $modeAllowed = ['full','compact','summary','index'];
 if (!in_array($modeRequested, $modeAllowed,true)) $modeRequested = 'full';
@@ -261,12 +254,12 @@ $mode = ($modeRequested==='index') ? 'compact' : $modeRequested;
 
 $maxPorNivel = ($maxPorNivelParam && $maxPorNivelParam>0)?$maxPorNivelParam:$MAX_RESULTS_PER_LEVEL;
 $maxTokensEffective = $maxTokensParam!==null?max(0,(int)$maxTokensParam):($mode==='full'?$DEFAULT_FULL_TOKEN_LIMIT:null);
-
 $incluirTextoCompleto = ($articulo!==null)||$rango||$mode==='full';
+
 $resultados = buscarCoincidencias($q,$materia,$index,$articulo,$codigoFiltro,$incluirTextoCompleto,$rango);
 
 // ==========================================================
-// SALIDA (idéntica a tu versión, sin cambios sustantivos)
+// SALIDA
 // ==========================================================
 $nivelesAgrupados = agruparPorKelsen($resultados,$maxPorNivel);
 [$niveles,$truncadoPorTokens,$totalTokens] = limitarNivelesPorTokens($nivelesAgrupados,$maxTokensEffective);
