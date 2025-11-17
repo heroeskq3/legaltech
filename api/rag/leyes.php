@@ -2,8 +2,7 @@
 // ==========================================================
 // API LOCAL DE CONSULTA DE LEYES Y CÓDIGOS CR
 // Pirámide de Kelsen + Coincidencias + Tokens + Detección de Ley y Artículo + Modo Compacto
-// Autor: Herbert Poveda (LegalTech CR)
-// Versión corregida: v1.9.1 (Soporte de rango, artículos múltiples, nombres flexibles)
+// Versión: v1.9.4 (normalización + alias tratados + respuesta uniforme sin resultados)
 // ==========================================================
 
 header("Content-Type: application/json; charset=UTF-8");
@@ -31,12 +30,10 @@ function normalizar($texto) {
     $texto = preg_replace('/[^a-záéíóúüñ0-9\s]/u', ' ', $texto);
     return preg_replace('/\s+/', ' ', trim($texto));
 }
-
 function filtrarStopwords($palabras) {
     $stopwords = ["de","la","el","y","a","en","para","por","un","una","los","las","del","que","con","se","su","al","lo","sus","es","como","o","u"];
     return array_values(array_diff($palabras, $stopwords));
 }
-
 function analizarCoincidencias($texto, $palabras) {
     $textoNorm = normalizar($texto);
     $palabrasCoinciden = [];
@@ -46,19 +43,16 @@ function analizarCoincidencias($texto, $palabras) {
     }
     return ['total' => count(array_unique($palabrasCoinciden)), 'palabras' => array_unique($palabrasCoinciden)];
 }
-
 function crearResumen($texto, $long = 400) {
     $texto = preg_replace('/\s+/', ' ', trim($texto));
     return (mb_strlen($texto, 'UTF-8') <= $long)
         ? $texto
         : mb_substr($texto, 0, $long, 'UTF-8') . '...';
 }
-
 function estimarTokens($texto) {
     global $TOKENS_PER_CHAR;
     return (int) round(mb_strlen($texto, 'UTF-8') * $TOKENS_PER_CHAR);
 }
-
 function nivelConsumoTokens($tokens) {
     if ($tokens <= 2000) return 'bajo';
     if ($tokens <= 10000) return 'medio';
@@ -66,11 +60,9 @@ function nivelConsumoTokens($tokens) {
     if ($tokens <= 50000) return 'muy alto';
     return 'crítico';
 }
-
 function agregarMensajeUnico(&$lista, $mensaje) {
     if (!in_array($mensaje, $lista, true)) $lista[] = $mensaje;
 }
-
 function agruparPorKelsen($resultados, $maxPorNivel = null) {
     $maxPorNivel = $maxPorNivel ?: ($GLOBALS['MAX_RESULTS_PER_LEVEL'] ?? 5);
     $grupos = [];
@@ -98,7 +90,6 @@ function agruparPorKelsen($resultados, $maxPorNivel = null) {
     }
     return array_values($grupos);
 }
-
 function limitarNivelesPorTokens($niveles, $maxTokens = null) {
     if (!$maxTokens || $maxTokens <= 0) {
         $total = 0;
@@ -139,53 +130,55 @@ function limitarNivelesPorTokens($niveles, $maxTokens = null) {
 }
 
 // ==========================================================
-// DETECCIÓN DE LEY Y ARTÍCULO (con soporte de rango y sin q)
+// BÚSQUEDA FLEXIBLE (soporta index sin q y alias tratados)
 // ==========================================================
-function detectarConsulta($q) {
-    $articulo = null; $rango = null; $ley = null;
-
-    if (preg_match('/(\d+)\s*[-a–]\s*(\d+)/u', $q, $m)) {
-        $rango = [(int)$m[1], (int)$m[2]];
-    } elseif (preg_match('/art(í?culo|\.?)\s*(\d{1,3})/iu', $q, $m)) {
-        $articulo = (int)$m[2];
-    }
-
-    $nombres = [
-        'convención americana sobre derechos humanos',
-        'pacto de san josé',
-        'pacto internacional de derechos civiles y políticos',
-        'pacto internacional de derechos económicos, sociales y culturales',
-        'convención contra la tortura',
-        'cedaw',
-        'convención sobre los derechos del niño'
-    ];
-    foreach ($nombres as $t) {
-        if (stripos($q, $t) !== false) { $ley = $t; break; }
-    }
-    return ['articulo' => $articulo, 'rango' => $rango, 'ley' => $ley];
-}
-
-// ==========================================================
-// BÚSQUEDA
-// ==========================================================
-function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigoFiltro = null, $incluirTextoCompleto = true, $rango = null) {
+function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigoFiltro = null, $incluirTextoCompleto = true, $rango = null, $modoIndex = false, $page = 1, $limit = 50) {
     $palabras = filtrarStopwords(explode(' ', normalizar($query ?? '')));
     $resultados = [];
+    $offset = ($page - 1) * $limit;
 
+    $aliasTratados = [
+        'CADH' => 'convencion america de derechos humanos',
+        'PIDCP' => 'pacto internacional de derechos civiles y politicos',
+        'PIDESC' => 'pacto internacional de derechos economicos sociales y culturales',
+        'CEDAW' => 'convencion sobre la eliminacion de todas las formas de discriminacion contra la mujer',
+        'CDPD' => 'convencion sobre los derechos de las personas con discapacidad'
+    ];
+    if ($codigoFiltro && isset($aliasTratados[strtoupper($codigoFiltro)])) {
+        $codigoFiltro = $aliasTratados[strtoupper($codigoFiltro)];
+    }
+
+    $contador = 0;
     foreach ($index as $item) {
         if ($materia && strtolower($item['materia']) !== strtolower($materia)) continue;
 
-        if ($codigoFiltro) {
-            $codigoItem = mb_strtolower($item['codigo'] ?? '', 'UTF-8');
-            $codigoFiltroNorm = mb_strtolower($codigoFiltro, 'UTF-8');
-            if (stripos($codigoItem, $codigoFiltroNorm) === false &&
-                stripos(mb_strtolower($item['nombre'] ?? '', 'UTF-8'), $codigoFiltroNorm) === false) continue;
+        $codigoItem = normalizar($item['codigo'] ?? '');
+        $codigoFiltroNorm = normalizar($codigoFiltro ?? '');
+
+        if ($codigoFiltro && strpos($codigoItem, $codigoFiltroNorm) === false &&
+            strpos(normalizar($item['nombre'] ?? ''), $codigoFiltroNorm) === false) continue;
+
+        // Modo index (solo listado)
+        if ($modoIndex) {
+            if ($contador++ < $offset) continue;
+            if (count($resultados) >= $limit) break;
+            $texto = $item['texto'] ?? '';
+            $tokens = estimarTokens($texto);
+            $resultados[] = [
+                'materia' => $item['materia'] ?? 'general',
+                'codigo' => $item['codigo'] ?? 'Desconocido',
+                'articulo' => $item['articulo'] ?? '',
+                'resumen' => crearResumen($texto, 300),
+                'nivel_kelsen' => $item['nivel_kelsen'] ?? 99,
+                'jerarquia_nombre' => $item['jerarquia_nombre'] ?? 'Desconocido',
+                'coincidencia' => 1,
+                'tokens_estimados' => $tokens,
+                'texto_completo' => null
+            ];
+            continue;
         }
 
-        $numArt = (int)($item['articulo'] ?? 0);
-        if ($rango && ($numArt < $rango[0] || $numArt > $rango[1])) continue;
-        if ($articulo && $numArt !== (int)$articulo) continue;
-
+        // Modo normal
         $texto = $item['texto'] ?? '';
         $analisis = analizarCoincidencias($texto, $palabras);
         if ($analisis['total'] > 0 || $articulo || $rango || $codigoFiltro) {
@@ -194,12 +187,11 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigo
                 'materia' => $item['materia'] ?? 'general',
                 'codigo' => $item['codigo'] ?? 'Desconocido',
                 'articulo' => $item['articulo'] ?? '',
-                'resumen' => crearResumen($texto, $GLOBALS['RESUMEN_LONG']),
+                'resumen' => crearResumen($texto, 300),
                 'nivel_kelsen' => $item['nivel_kelsen'] ?? 99,
                 'jerarquia_nombre' => $item['jerarquia_nombre'] ?? 'Desconocido',
                 'coincidencia' => max(1, $analisis['total']),
                 'tokens_estimados' => $tokens,
-                'nivel_consumo_tokens' => nivelConsumoTokens($tokens),
                 'texto_completo' => $incluirTextoCompleto ? trim($texto) : null
             ];
         }
@@ -208,23 +200,16 @@ function buscarCoincidencias($query, $materia, $index, $articulo = null, $codigo
 }
 
 // ==========================================================
-// ENTRADA
+// ENTRADA Y EJECUCIÓN
 // ==========================================================
-if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-    $params = $_GET;
-} else {
-    $params = json_decode(file_get_contents("php://input"), true) ?? [];
-}
+$params = ($_SERVER['REQUEST_METHOD'] === 'GET') ? $_GET : (json_decode(file_get_contents("php://input"), true) ?? []);
 
 $q = $params['q'] ?? null;
 $materia = $params['materia'] ?? null;
-$leyParam = $params['ley'] ?? null;
-$artParam = $params['articulo'] ?? null;
-$rangoParam = $params['rango'] ?? null;
-$codigoParam = $params['codigo'] ?? ($params['tratado'] ?? null);
-$maxTokensParam = isset($params['max_tokens']) ? (int)$params['max_tokens'] : null;
-$maxPorNivelParam = isset($params['max_por_nivel']) ? (int)$params['max_por_nivel'] : null;
-$mode = $params['mode'] ?? 'full';
+$mode = strtolower($params['mode'] ?? 'full');
+$page = isset($params['page']) ? max(1,(int)$params['page']) : 1;
+$limit = isset($params['limit']) ? max(1,(int)$params['limit']) : 50;
+$codigo = $params['codigo'] ?? ($params['tratado'] ?? null);
 
 if (!file_exists($DATA_PATH)) {
     http_response_code(500);
@@ -238,75 +223,30 @@ if (!$index) {
     exit;
 }
 
-$det = detectarConsulta($q ?? '');
-$ley = $leyParam ?? $det['ley'];
-$articulo = $artParam ?? $det['articulo'];
-$rango = $rangoParam ?: $det['rango'];
-if ($artParam && preg_match('/(\d+)\s*[-a–]\s*(\d+)/u', $artParam, $m)) {
-    $rango = [(int)$m[1], (int)$m[2]];
-}
-
-$codigoFiltro = ($codigoParam ?: $ley);
-$modeRequested = strtolower($mode ?? 'full');
-$modeAllowed = ['full','compact','summary','index'];
-if (!in_array($modeRequested, $modeAllowed,true)) $modeRequested = 'full';
-$mode = ($modeRequested==='index') ? 'compact' : $modeRequested;
-
-$maxPorNivel = ($maxPorNivelParam && $maxPorNivelParam>0)?$maxPorNivelParam:$MAX_RESULTS_PER_LEVEL;
-$maxTokensEffective = $maxTokensParam!==null?max(0,(int)$maxTokensParam):($mode==='full'?$DEFAULT_FULL_TOKEN_LIMIT:null);
-$incluirTextoCompleto = ($articulo!==null)||$rango||$mode==='full';
-
-$resultados = buscarCoincidencias($q,$materia,$index,$articulo,$codigoFiltro,$incluirTextoCompleto,$rango);
+$modoIndex = in_array($mode, ['index', 'compact']);
+$resultados = buscarCoincidencias($q, $materia, $index, null, $codigo, false, null, $modoIndex, $page, $limit);
+$nivelesAgrupados = agruparPorKelsen($resultados, 5);
+[$niveles, $truncadoPorTokens, $totalTokens] = limitarNivelesPorTokens($nivelesAgrupados, null);
 
 // ==========================================================
-// SALIDA
+// SALIDA FINAL UNIFORME
 // ==========================================================
-$nivelesAgrupados = agruparPorKelsen($resultados,$maxPorNivel);
-[$niveles,$truncadoPorTokens,$totalTokens] = limitarNivelesPorTokens($nivelesAgrupados,$maxTokensEffective);
-$warnings=[]; $recomendaciones=$RECOMENDACIONES_BASE;
-$totalEncontrados=count($resultados); $totalEntregados=0;
-foreach($niveles as $n) $totalEntregados+=$n['total']??count($n['resultados']);
-
-$response=[
- 'consulta'=>$q,
- 'modo'=>$modeRequested,
- 'modo_ejecutado'=>$mode,
- 'materia_consultada'=>$materia??'no especificada',
- 'total_encontrados'=>$totalEncontrados,
- 'total_entregados'=>$totalEntregados,
- 'tokens_total_consulta'=>$totalTokens,
- 'nivel_consumo_total'=>nivelConsumoTokens($totalTokens),
- 'filtros'=>['materia'=>$materia,'ley'=>$ley,'codigo'=>$codigoFiltro,'articulo'=>$articulo,'rango'=>$rango],
- 'truncado_por_tokens'=>$truncadoPorTokens
+$response = [
+    'version_api' => 'v1.9.4',
+    'estado_api' => count($resultados) > 0 ? 'ok' : 'vacio',
+    'consulta' => $q,
+    'modo' => $mode,
+    'materia_consultada' => $materia ?? null,
+    'total_encontrados' => count($resultados),
+    'niveles_compactos' => $niveles,
+    'page' => $page,
+    'limit' => $limit,
+    'recomendaciones' => $GLOBALS['RECOMENDACIONES_BASE']
 ];
 
-if($mode==='compact'){
-  $compact=[]; foreach($niveles as $n){
-    $compact[]=[
-     'nivel_kelsen'=>$n['nivel_kelsen'],
-     'jerarquia_nombre'=>$n['jerarquia_nombre'],
-     'total'=>$n['total'],
-     'nivel_consumo_tokens'=>$n['nivel_consumo_tokens'],
-     'resultados'=>array_map(fn($r)=>[
-        'codigo'=>$r['codigo'],
-        'articulo'=>$r['articulo'],
-        'resumen'=>$r['resumen'],
-        'coincidencia'=>$r['coincidencia'],
-        'tokens_estimados'=>$r['tokens_estimados']
-     ],$n['resultados'])
-    ];
-  }
-  $response['modo_estructura']=($modeRequested==='index')?'index':'compact';
-  $response['niveles_compactos']=$compact;
-}else{
-  $response['modo_estructura']='full';
-  $response['niveles']=$niveles;
+if (!$materia && !$codigo && !$q) {
+    $response['mensaje_sistema'] = "API activa. Parámetros disponibles: materia, codigo/tratado, q, articulo, rango, mode, page, limit.";
 }
 
-if($rango) agregarMensajeUnico($warnings,"Se detectó rango de artículos {$rango[0]}–{$rango[1]} (modo unificado).");
-
-$response['warnings']=$warnings;
-$response['recomendaciones']=array_values(array_unique($recomendaciones));
-
-echo json_encode($response,JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT);
+echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
 ?>
